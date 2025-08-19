@@ -209,6 +209,37 @@ func enableBBR() error {
 	return nil
 }
 
+// 測試與目標服務器的連通性
+func testConnectivity(serverHost string, port int, timeout time.Duration) error {
+	log.Printf("Testing connectivity to %s:%d...", serverHost, port)
+	
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", serverHost, port), timeout)
+	if err != nil {
+		return fmt.Errorf("failed to connect to %s:%d: %v", serverHost, port, err)
+	}
+	conn.Close()
+	
+	log.Printf("✓ Connectivity test successful to %s:%d", serverHost, port)
+	return nil
+}
+
+// 驗證IP地址格式
+func validateIPAddress(ip string) error {
+	if ip == "localhost" {
+		return nil // localhost is valid
+	}
+	
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		// 嘗試解析為域名
+		_, err := net.LookupHost(ip)
+		if err != nil {
+			return fmt.Errorf("invalid IP address or hostname: %s", ip)
+		}
+	}
+	return nil
+}
+
 // 單一連接傳輸 (Mirror模式：發送後也接收)
 func performTransfer(config *ClientConfig, transferSize int64, connId int, wg *sync.WaitGroup, 
 	totalSentBytes *int64, totalReceivedBytes *int64, errors *int64) {
@@ -340,6 +371,16 @@ func runTestLoop(config *ClientConfig, transferSize int64) {
 		TransferSizeMB: int(transferSize / (1024 * 1024)),
 	}
 	
+	// 驗證目標IP地址
+	if err := validateIPAddress(config.ServerHost); err != nil {
+		log.Fatalf("IP validation failed: %v", err)
+	}
+	
+	// 測試連通性
+	if err := testConnectivity(config.ServerHost, config.Port, 10*time.Second); err != nil {
+		log.Fatalf("Connectivity test failed: %v", err)
+	}
+	
 	// 獲取網路介面資訊
 	session.NetworkInterface, session.InterfaceSpeed = getNetworkInterfaceInfo()
 	
@@ -387,9 +428,10 @@ func runTestLoop(config *ClientConfig, transferSize int64) {
 
 func main() {
 	var (
-		serverHost   = flag.String("host", "localhost", "Server hostname or IP")
+		serverHost   = flag.String("c", "", "Connect to server IP address (like iperf -c)")
+		hostFlag     = flag.String("host", "localhost", "Server hostname or IP (deprecated, use -c instead)")
 		port         = flag.Int("port", DefaultPort, "Server port")
-		connections  = flag.Int("c", DefaultConnections, "Number of parallel connections")
+		connections  = flag.Int("P", DefaultConnections, "Number of parallel connections")
 		bufferSize   = flag.Int("buffer", DefaultBufferSize, "Buffer size in bytes")
 		transferMB   = flag.Int("size", DefaultTransferSize/(1024*1024), "Transfer size in MB per test")
 		testDuration = flag.Int("t", 60, "Total test duration in seconds")
@@ -397,6 +439,16 @@ func main() {
 		debug        = flag.Bool("debug", false, "Enable debug logging")
 	)
 	flag.Parse()
+	
+	// 處理 -c 參數，如果沒有指定則使用 -host
+	targetHost := *serverHost
+	if targetHost == "" {
+		targetHost = *hostFlag
+	}
+	
+	if targetHost == "" {
+		log.Fatalf("Error: Must specify target server using -c <IP> (like iperf)")
+	}
 	
 	// 驗證參數
 	if *connections > MaxConnections {
@@ -408,7 +460,7 @@ func main() {
 	}
 	
 	config := &ClientConfig{
-		ServerHost:   *serverHost,
+		ServerHost:   targetHost,
 		Port:         *port,
 		Connections:  *connections,
 		BufferSize:   *bufferSize,

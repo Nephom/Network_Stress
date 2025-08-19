@@ -32,6 +32,7 @@ type ServerConfig struct {
 	BufferSize  int
 	Optimize    bool
 	Debug       bool
+	BindIP      string
 }
 
 type ConnectionStats struct {
@@ -161,6 +162,114 @@ func enableBBR() error {
 	return nil
 }
 
+// 獲取系統網路介面資訊
+func getNetworkInterfaces() ([]net.Interface, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get network interfaces: %v", err)
+	}
+	return interfaces, nil
+}
+
+// 檢查網路介面是否有有效的IP地址
+func checkInterfaceIPs() error {
+	interfaces, err := getNetworkInterfaces()
+	if err != nil {
+		return err
+	}
+
+	var activeInterfaces []string
+	var inactiveInterfaces []string
+
+	for _, iface := range interfaces {
+		// 跳過loopback和down的介面
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			log.Printf("Warning: Failed to get addresses for interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		hasValidIP := false
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil { // IPv4
+					activeInterfaces = append(activeInterfaces, fmt.Sprintf("%s: %s", iface.Name, ipnet.IP.String()))
+					hasValidIP = true
+				}
+			}
+		}
+
+		if !hasValidIP {
+			inactiveInterfaces = append(inactiveInterfaces, iface.Name)
+		}
+	}
+
+	log.Println("Network Interface Status:")
+	log.Println("========================")
+	
+	if len(activeInterfaces) > 0 {
+		log.Println("Active interfaces with valid IP addresses:")
+		for _, iface := range activeInterfaces {
+			log.Printf("  ✓ %s", iface)
+		}
+	}
+
+	if len(inactiveInterfaces) > 0 {
+		log.Println("Interfaces without valid IP addresses:")
+		for _, iface := range inactiveInterfaces {
+			log.Printf("  ✗ %s (no valid IP configured)", iface)
+		}
+		log.Println("Please configure IP addresses for the above interfaces if needed.")
+	}
+
+	if len(activeInterfaces) == 0 {
+		return fmt.Errorf("no network interfaces with valid IP addresses found")
+	}
+
+	return nil
+}
+
+// 驗證綁定IP地址
+func validateBindIP(bindIP string) error {
+	if bindIP == "" || bindIP == "0.0.0.0" {
+		return nil // 綁定所有介面
+	}
+
+	// 檢查IP格式
+	ip := net.ParseIP(bindIP)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address format: %s", bindIP)
+	}
+
+	// 檢查IP是否存在於本機介面上
+	interfaces, err := getNetworkInterfaces()
+	if err != nil {
+		return err
+	}
+
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipnet.IP.Equal(ip) {
+					log.Printf("Binding to interface %s with IP %s", iface.Name, bindIP)
+					return nil
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("IP address %s not found on any local network interface", bindIP)
+}
+
 // 處理單一連接 (Mirror模式：接收後也發送)
 func handleConnection(conn net.Conn, config *ServerConfig, stats *ServerStats, transferSize int64) {
 	defer conn.Close()
@@ -269,6 +378,16 @@ func handleConnection(conn net.Conn, config *ServerConfig, stats *ServerStats, t
 func startServer(config *ServerConfig, transferSize int64) error {
 	stats := &ServerStats{}
 	
+	// 檢查網路介面狀態
+	if err := checkInterfaceIPs(); err != nil {
+		return fmt.Errorf("network interface check failed: %v", err)
+	}
+	
+	// 驗證綁定IP
+	if err := validateBindIP(config.BindIP); err != nil {
+		return fmt.Errorf("bind IP validation failed: %v", err)
+	}
+	
 	// 如果啟用優化，嘗試啟用BBR
 	if config.Optimize {
 		if err := enableBBR(); err != nil {
@@ -276,13 +395,23 @@ func startServer(config *ServerConfig, transferSize int64) error {
 		}
 	}
 	
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
+	// 構建監聽地址
+	listenAddr := fmt.Sprintf("%s:%d", config.BindIP, config.Port)
+	if config.BindIP == "" {
+		listenAddr = fmt.Sprintf(":%d", config.Port)
+	}
+	
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %v", config.Port, err)
+		return fmt.Errorf("failed to listen on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
 	
-	log.Printf("Server listening on port %d", config.Port)
+	if config.BindIP == "" {
+		log.Printf("Server listening on all interfaces, port %d", config.Port)
+	} else {
+		log.Printf("Server listening on %s:%d", config.BindIP, config.Port)
+	}
 	log.Printf("Configuration: Buffer=%dMB, MaxConnections=%d, Optimize=%v", 
 		config.BufferSize/(1024*1024), config.Connections, config.Optimize)
 	
@@ -329,6 +458,7 @@ func startServer(config *ServerConfig, transferSize int64) error {
 func main() {
 	var (
 		port        = flag.Int("port", DefaultPort, "Server port")
+		bindIP      = flag.String("bind", "", "IP address to bind to (empty for all interfaces)")
 		connections = flag.Int("c", DefaultConnections, "Maximum concurrent connections")
 		bufferSize  = flag.Int("buffer", DefaultBufferSize, "Buffer size in bytes")
 		transferMB  = flag.Int("size", DefaultTransferSize/(1024*1024), "Transfer size in MB")
@@ -344,6 +474,7 @@ func main() {
 	
 	config := &ServerConfig{
 		Port:        *port,
+		BindIP:      *bindIP,
 		Connections: *connections,
 		BufferSize:  *bufferSize,
 		Optimize:    *optimize,
