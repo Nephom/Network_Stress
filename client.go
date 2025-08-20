@@ -288,13 +288,15 @@ func performTransfer(config *ClientConfig, transferSize int64, connId int, wg *s
 			return
 		}
 		sent += int64(n)
+		
+		if config.Debug && sent%1048576 == 0 { // 每1MB打印一次
+			log.Printf("Connection %d sent %d MB", connId, sent/1048576)
+		}
 	}
 	
-	// 發送完畢後，等待伺服器準備好發送數據回來
-	// 關閉寫入端，但保持連接開啟以接收數據
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.CloseWrite()
-	}
+	// 發送完畢後，給服務器一些時間處理數據
+	// 不立即關閉寫入端，讓服務器有時間響應
+	time.Sleep(100 * time.Millisecond)
 	
 	// Phase 2: Mirror模式 - 接收伺服器發送回來的數據
 	receiveBuffer := make([]byte, config.BufferSize)

@@ -51,13 +51,13 @@ type ServerStats struct {
 	AvgThroughput       float64
 	ActiveConnections   int64
 	ConnectionStats     []ConnectionStats
+	CompletedConnections int64  // 新增：已完成的连接数
 }
 
 func (s *ServerStats) AddConnectionStat(stat ConnectionStats) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
-	s.TotalConnections++
 	s.TotalBytes += stat.BytesTransferred
 	s.TotalDuration += stat.Duration
 	s.ConnectionStats = append(s.ConnectionStats, stat)
@@ -81,7 +81,13 @@ func (s *ServerStats) AddConnectionStat(stat ConnectionStats) {
 func (s *ServerStats) GetStats() (int64, int64, float64, float64, float64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.TotalConnections, s.TotalBytes, s.MaxThroughput, s.MinThroughput, s.AvgThroughput
+	return s.CompletedConnections, s.TotalBytes, s.MaxThroughput, s.MinThroughput, s.AvgThroughput
+}
+
+func (s *ServerStats) IncrementCompleted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CompletedConnections++
 }
 
 func (s *ServerStats) IncrementActive() {
@@ -294,8 +300,10 @@ func handleConnection(conn net.Conn, config *ServerConfig, stats *ServerStats, t
 	
 	// Phase 1: 接收數據
 	receiveStart := time.Now()
-	for totalBytesReceived < transferSize {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// 设置较短的读取超时，避免无限等待
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	
+	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
@@ -304,73 +312,113 @@ func handleConnection(conn net.Conn, config *ServerConfig, stats *ServerStats, t
 				}
 				break
 			}
+			// 检查是否是超时错误
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if config.Debug {
+					log.Printf("Read timeout from %s, received %d bytes", clientAddr, totalBytesReceived)
+				}
+				break
+			}
 			if config.Debug {
 				log.Printf("Read error from %s: %v", clientAddr, err)
 			}
 			return
 		}
+		
+		if n == 0 {
+			break // 没有更多数据
+		}
+		
 		totalBytesReceived += int64(n)
 		
-		// 如果已接收到預期數據量，跳出循環
-		if totalBytesReceived >= transferSize {
-			break
+		if config.Debug && totalBytesReceived%1048576 == 0 { // 每1MB打印一次
+			log.Printf("Received %d MB from %s", totalBytesReceived/1048576, clientAddr)
 		}
+		
+		// 重置读取超时
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}
 	receiveDuration := time.Since(receiveStart)
-	receiveThroughput := float64(totalBytesReceived*8) / float64(receiveDuration.Nanoseconds()) * 1e9 / 1e9
+	var receiveThroughput float64
+	if receiveDuration.Nanoseconds() > 0 && totalBytesReceived > 0 {
+		receiveThroughput = float64(totalBytesReceived*8) / float64(receiveDuration.Nanoseconds()) * 1e9 / 1e9
+	}
 	
 	// Phase 2: Mirror模式 - 發送相同大小的數據回去
 	sendStart := time.Now()
 	var totalBytesSent int64
 	
-	// 生成隨機數據發送回客戶端
-	sendBuffer := make([]byte, config.BufferSize)
-	if _, err := rand.Read(sendBuffer); err != nil {
-		log.Printf("Warning: Failed to generate random data for %s: %v", clientAddr, err)
-		return
-	}
-	
-	for totalBytesSent < transferSize {
-		remaining := transferSize - totalBytesSent
-		writeSize := int64(len(sendBuffer))
-		if remaining < writeSize {
-			writeSize = remaining
+	// 只有在成功接收到数据后才发送回去
+	if totalBytesReceived > 0 {
+		// 生成隨機數據發送回客戶端
+		sendBuffer := make([]byte, config.BufferSize)
+		if _, err := rand.Read(sendBuffer); err != nil {
+			log.Printf("Warning: Failed to generate random data for %s: %v", clientAddr, err)
+			// 即使生成随机数据失败，也继续发送零数据
+			sendBuffer = make([]byte, config.BufferSize)
 		}
 		
-		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		n, err := conn.Write(sendBuffer[:writeSize])
-		if err != nil {
-			if config.Debug {
-				log.Printf("Write error to %s: %v", clientAddr, err)
+		// 发送与接收到的数据量相同的数据
+		targetSendSize := totalBytesReceived
+		for totalBytesSent < targetSendSize {
+			remaining := targetSendSize - totalBytesSent
+			writeSize := int64(len(sendBuffer))
+			if remaining < writeSize {
+				writeSize = remaining
 			}
-			return
+			
+			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			n, err := conn.Write(sendBuffer[:writeSize])
+			if err != nil {
+				if config.Debug {
+					log.Printf("Write error to %s: %v", clientAddr, err)
+				}
+				break // 不要return，继续记录统计
+			}
+			totalBytesSent += int64(n)
 		}
-		totalBytesSent += int64(n)
 	}
 	sendDuration := time.Since(sendStart)
-	sendThroughput := float64(totalBytesSent*8) / float64(sendDuration.Nanoseconds()) * 1e9 / 1e9
+	var sendThroughput float64
+	if sendDuration.Nanoseconds() > 0 && totalBytesSent > 0 {
+		sendThroughput = float64(totalBytesSent*8) / float64(sendDuration.Nanoseconds()) * 1e9 / 1e9
+	}
 	
 	totalDuration := time.Since(start)
 	
-	// 記錄接收統計
-	receiveStats := ConnectionStats{
-		BytesTransferred: totalBytesReceived,
-		Duration:         receiveDuration,
-		Throughput:       receiveThroughput,
-	}
-	stats.AddConnectionStat(receiveStats)
-	
-	// 記錄發送統計
-	sendStats := ConnectionStats{
-		BytesTransferred: totalBytesSent,
-		Duration:         sendDuration,
-		Throughput:       sendThroughput,
-	}
-	stats.AddConnectionStat(sendStats)
-	
-	if config.Debug {
-		log.Printf("Mirror connection from %s completed: RX=%d bytes/%.2f Gbps, TX=%d bytes/%.2f Gbps, Total=%.2fs", 
-			clientAddr, totalBytesReceived, receiveThroughput, totalBytesSent, sendThroughput, totalDuration.Seconds())
+	// 只有在有实际数据传输时才记录统计
+	if totalBytesReceived > 0 || totalBytesSent > 0 {
+		// 記錄接收統計
+		if totalBytesReceived > 0 {
+			receiveStats := ConnectionStats{
+				BytesTransferred: totalBytesReceived,
+				Duration:         receiveDuration,
+				Throughput:       receiveThroughput,
+			}
+			stats.AddConnectionStat(receiveStats)
+		}
+		
+		// 記錄發送統計
+		if totalBytesSent > 0 {
+			sendStats := ConnectionStats{
+				BytesTransferred: totalBytesSent,
+				Duration:         sendDuration,
+				Throughput:       sendThroughput,
+			}
+			stats.AddConnectionStat(sendStats)
+		}
+		
+		// 標記連接完成
+		stats.IncrementCompleted()
+		
+		if config.Debug {
+			log.Printf("Mirror connection from %s completed: RX=%d bytes/%.2f Gbps, TX=%d bytes/%.2f Gbps, Total=%.2fs", 
+				clientAddr, totalBytesReceived, receiveThroughput, totalBytesSent, sendThroughput, totalDuration.Seconds())
+		}
+	} else {
+		if config.Debug {
+			log.Printf("Connection from %s completed with no data transfer", clientAddr)
+		}
 	}
 }
 
